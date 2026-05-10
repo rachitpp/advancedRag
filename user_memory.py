@@ -1,44 +1,48 @@
 """
-User memory subsystem (Tier 2: long-term, cross-session).
+User memory (Tier 2): durable per-user facts in Postgres + pgvector.
 
-What it does:
-  - Extracts durable facts about the user from each conversation turn.
-  - Stores them in a per-user namespace in a vector store.
-  - Retrieves relevant facts at query time, semantically matched to the question.
-  - Injects retrieved facts into the answer prompt as a separate context block.
+Single shared table, filtered by user_id (and optional tenant_id) at query
+time. Replaces the previous per-user Chroma collections, which did not scale.
 
-What it doesn't do:
-  - Replace conversational memory — they're complementary. Conversational handles
-    "it/that" within a session; user memory handles "I'm allergic to X" across sessions.
-  - Auto-decay or fact contradiction resolution. (Future work — see __doc__ of
-    UserMemoryStore for the design hooks already in place.)
-
-Why a separate Chroma collection per user:
-  - Strong isolation: a similarity search for user A NEVER returns user B's facts.
-    Filtering by metadata works but is fragile — separate collections is safer.
-  - Trades per-user index overhead for security. At scale (>10k users) you'd
-    move to a shared collection with strict metadata filtering + row-level
-    security at the DB layer. Not yet.
-
-Async extraction:
-  - Extraction runs AFTER the response is sent (background thread).
-  - The user gets their answer with no added latency.
-  - If extraction fails, we log and move on — never block the response.
-  - Caller passes a single shared ThreadPoolExecutor (lifecycle managed by pipeline).
+Schema (created idempotently at startup):
+  user_facts(
+    id BIGSERIAL PK,
+    user_id TEXT NOT NULL,
+    tenant_id TEXT,
+    fact_text TEXT NOT NULL,
+    embedding VECTOR(d) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+  )
+  + IVFFlat index on (embedding) and B-tree on (user_id, tenant_id)
 """
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import logging
-import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Index,
+    String,
+    Text,
+    delete,
+    func,
+    select,
+    text,
+)
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from .config import CRAGConfig
 from .llm import LLMClients
@@ -50,112 +54,182 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Helpers
+# ORM
 # ============================================================================
 
-def _safe_user_dir(user_id: str) -> str:
-    """
-    Sanitize user_id for filesystem use.
-    SHA-256 prefix avoids exposing real user IDs in directory names.
-    """
-    digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16]
-    return f"user_{digest}"
+class _Base(DeclarativeBase):
+    pass
+
+
+def make_user_fact_model(embedding_dim: int) -> type:
+    class UserFact(_Base):
+        __tablename__ = "user_facts"
+
+        id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+        user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+        tenant_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+        fact_text: Mapped[str] = mapped_column(Text, nullable=False)
+        embedding: Mapped[list[float]] = mapped_column(Vector(embedding_dim), nullable=False)
+        created_at: Mapped[datetime] = mapped_column(
+            DateTime(timezone=True), server_default=func.now()
+        )
+
+        __table_args__ = (
+            Index("ix_user_facts_user_tenant", "user_id", "tenant_id"),
+        )
+
+    return UserFact
+
+
+@dataclass
+class RetrievedFact:
+    text: str
+    score: float
 
 
 # ============================================================================
 # Store
 # ============================================================================
 
-@dataclass
-class RetrievedFact:
-    text: str
-    score: float    # similarity score, lower = more similar (Chroma default)
-
-
-class UserMemoryStore:
+class PostgresUserMemoryStore:
     """
-    Per-user vector store of durable facts.
-
-    Stores Chroma collections under {cfg.user_memory_dir}/user_<hash>/. Each
-    write is one fact = one Document. Reads are top-K similarity search
-    against the incoming question.
-
-    Future hooks (not implemented yet):
-      - Fact decay: timestamp metadata is stored, so a future job can prune
-        facts older than N months.
-      - Contradiction resolution: when a new fact contradicts an old one
-        (e.g., "I work in finance" vs "I just changed jobs to healthcare"),
-        we'd use an LLM to merge or replace. For now we just append.
+    Async pgvector-backed user-fact store. Idempotent schema init.
     """
 
     def __init__(self, cfg: CRAGConfig, clients: LLMClients):
         self.cfg = cfg
         self.clients = clients
-        self._stores: dict[str, Chroma] = {}     # user_id -> Chroma
-        self._lock = threading.Lock()
+        self._engine: Optional[AsyncEngine] = None
+        self._session_maker: Optional[async_sessionmaker[AsyncSession]] = None
+        self._init_lock = asyncio.Lock()
+        self._initialized = False
+        self.UserFact = make_user_fact_model(cfg.embedding_dim)
 
-    def _get_store(self, user_id: str) -> Chroma:
-        with self._lock:
-            if user_id in self._stores:
-                return self._stores[user_id]
-            persist_dir = os.path.join(
-                self.cfg.user_memory_dir, _safe_user_dir(user_id)
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            self._engine = create_async_engine(
+                self.cfg.postgres_dsn,
+                pool_size=self.cfg.postgres_pool_size,
+                max_overflow=self.cfg.postgres_max_overflow,
+                pool_pre_ping=True,
             )
-            os.makedirs(persist_dir, exist_ok=True)
-            store = Chroma(
-                persist_directory=persist_dir,
-                embedding_function=self.clients.embeddings,
+            self._session_maker = async_sessionmaker(
+                self._engine, expire_on_commit=False
             )
-            self._stores[user_id] = store
-            return store
 
-    # ---- Write --------------------------------------------------------
+            async with self._engine.begin() as conn:
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                await conn.run_sync(_Base.metadata.create_all)
+                # Create IVFFlat index for cosine; idempotent guard.
+                await conn.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_user_facts_embedding "
+                    "ON user_facts USING ivfflat (embedding vector_cosine_ops) "
+                    "WITH (lists = 100);"
+                ))
+            self._initialized = True
 
-    def add_facts(self, user_id: str, facts: list[str]) -> int:
-        """Append facts as new documents. Returns count actually added."""
+    async def aclose(self) -> None:
+        if self._engine is not None:
+            await self._engine.dispose()
+
+    # ---- Write ----
+
+    async def add_facts(
+        self,
+        user_id: str,
+        facts: list[str],
+        tenant_id: Optional[str] = None,
+    ) -> int:
         if not facts:
             return 0
+        await self.initialize()
+        assert self._session_maker is not None
         try:
-            store = self._get_store(user_id)
-            import time as _time  # local import — keep store module import light
-            now = _time.time()
-            store.add_texts(
-                texts=facts,
-                metadatas=[{"timestamp": now, "user_id": user_id} for _ in facts],
-            )
-            return len(facts)
+            embeddings = await self.clients.embeddings.aembed_documents(facts)
         except Exception as exc:
-            logger.warning(
-                "Failed to add %d facts for user %s: %s", len(facts), user_id, exc
-            )
+            logger.warning("Embedding facts failed: %s", exc)
             return 0
 
-    # ---- Read ---------------------------------------------------------
-
-    def retrieve(
-        self, user_id: str, question: str, top_k: int, min_relevance: float
-    ) -> list[RetrievedFact]:
-        """
-        Return facts relevant to the question.
-        Chroma returns distance (lower = more similar); we convert to a
-        normalized relevance score and threshold on it.
-        """
+        rows = [
+            self.UserFact(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                fact_text=fact,
+                embedding=emb,
+            )
+            for fact, emb in zip(facts, embeddings)
+        ]
         try:
-            store = self._get_store(user_id)
-            results = store.similarity_search_with_score(question, k=top_k)
+            async with self._session_maker() as session:
+                session.add_all(rows)
+                await session.commit()
+            return len(rows)
         except Exception as exc:
-            logger.warning("User memory retrieval failed for %s: %s", user_id, exc)
+            logger.warning("add_facts failed for user %s: %s", user_id, exc)
+            return 0
+
+    # ---- Read ----
+
+    async def retrieve(
+        self,
+        user_id: str,
+        question: str,
+        top_k: int,
+        min_relevance: float,
+        tenant_id: Optional[str] = None,
+    ) -> list[RetrievedFact]:
+        await self.initialize()
+        assert self._session_maker is not None
+        try:
+            qvec = await self.clients.embeddings.aembed_query(question)
+        except Exception as exc:
+            logger.warning("Embedding query failed: %s", exc)
+            return []
+
+        UF = self.UserFact
+        distance_expr = UF.embedding.cosine_distance(qvec)
+        stmt = (
+            select(UF.fact_text, distance_expr.label("distance"))
+            .where(UF.user_id == user_id)
+        )
+        if tenant_id is not None:
+            stmt = stmt.where(UF.tenant_id == tenant_id)
+        stmt = stmt.order_by(distance_expr).limit(top_k)
+
+        try:
+            async with self._session_maker() as session:
+                result = await session.execute(stmt)
+                rows = result.all()
+        except Exception as exc:
+            logger.warning("Retrieve facts failed: %s", exc)
             return []
 
         out: list[RetrievedFact] = []
-        for doc, distance in results:
-            # Chroma returns L2 distance for default embeddings. We convert
-            # to a [0,1] relevance score with a soft transform — exact mapping
-            # depends on embedding model, so the threshold is a tunable knob.
-            relevance = 1.0 / (1.0 + float(distance))
+        for fact_text, distance in rows:
+            relevance = 1.0 - float(distance)  # cosine distance -> similarity
             if relevance >= min_relevance:
-                out.append(RetrievedFact(text=doc.page_content, score=relevance))
+                out.append(RetrievedFact(text=fact_text, score=relevance))
         return out
+
+    async def clear_user(self, user_id: str, tenant_id: Optional[str] = None) -> int:
+        await self.initialize()
+        assert self._session_maker is not None
+        UF = self.UserFact
+        stmt = delete(UF).where(UF.user_id == user_id)
+        if tenant_id is not None:
+            stmt = stmt.where(UF.tenant_id == tenant_id)
+        try:
+            async with self._session_maker() as session:
+                result = await session.execute(stmt)
+                await session.commit()
+                return int(result.rowcount or 0)
+        except Exception as exc:
+            logger.warning("clear_user failed: %s", exc)
+            return 0
 
 
 # ============================================================================
@@ -163,8 +237,6 @@ class UserMemoryStore:
 # ============================================================================
 
 class UserFactExtractor:
-    """LLM-driven extraction of durable facts from a single conversation turn."""
-
     def __init__(self, cfg: CRAGConfig, clients: LLMClients):
         self.cfg = cfg
         self._chain = (
@@ -172,140 +244,109 @@ class UserFactExtractor:
             | clients.fast.with_structured_output(ExtractedUserFacts)
         )
 
-    def extract(self, user_message: str, assistant_message: str) -> list[str]:
-        """Returns durable facts. Empty list if nothing memory-worthy."""
+    async def extract(
+        self, user_message: str, assistant_message: str
+    ) -> list[str]:
         try:
-            result = self._chain.invoke({
+            result = await self._chain.ainvoke({
                 "user_message": user_message,
                 "assistant_message": assistant_message,
             })
         except Exception as exc:
-            logger.warning("User fact extraction failed: %s", exc)
+            logger.warning("Fact extraction failed: %s", exc)
             return []
 
-        # Sanity filtering — drop trivially short facts and questions.
         cleaned: list[str] = []
         for fact in result.facts:
             stripped = fact.strip().rstrip(".")
-            if not stripped:
+            if not stripped or len(stripped.split()) < 3 or stripped.endswith("?"):
                 continue
-            if len(stripped.split()) < 3:
-                continue
-            if stripped.endswith("?"):
-                continue   # extractor occasionally returns user questions
             cleaned.append(stripped)
         return cleaned
 
 
 # ============================================================================
-# Manager (composition root for user memory)
+# Manager
 # ============================================================================
 
 class UserMemoryManager:
     """
     Coordinates extraction + storage + retrieval. Owned by the pipeline.
-
-    The pipeline calls:
-      - retrieve_for_question(...) BEFORE generation, to inject facts
-      - schedule_extraction(...)   AFTER generation, to update memory
-
-    Both are no-ops if user_memory_enabled=False or user_id is None.
+    Read path is awaited inline. Write path is fire-and-forget via a tracked
+    task set on the pipeline so we can drain it on shutdown.
     """
 
     def __init__(
         self,
         cfg: CRAGConfig,
         clients: LLMClients,
-        extraction_pool: ThreadPoolExecutor,
+        store: PostgresUserMemoryStore,
+        background_tasks: set[asyncio.Task],
     ):
         self.cfg = cfg
-        self.store = UserMemoryStore(cfg, clients)
+        self.store = store
         self.extractor = UserFactExtractor(cfg, clients)
-        self._extraction_pool = extraction_pool
+        self._background_tasks = background_tasks
 
     @property
     def enabled(self) -> bool:
         return self.cfg.user_memory_enabled
 
-    # ---- Read path ----------------------------------------------------
-
-    def retrieve_for_question(
+    async def retrieve_for_question(
         self,
         user_id: Optional[str],
         question: str,
         telemetry: TelemetryCollector,
+        tenant_id: Optional[str] = None,
     ) -> list[RetrievedFact]:
         if not self.enabled or not user_id:
             return []
-
-        with telemetry.time_stage("user_memory_retrieve"):
-            facts = self.store.retrieve(
+        async with telemetry.atime_stage("user_memory_retrieve"):
+            facts = await self.store.retrieve(
                 user_id=user_id,
                 question=question,
                 top_k=self.cfg.user_memory_top_k,
                 min_relevance=self.cfg.user_memory_min_relevance,
+                tenant_id=tenant_id,
             )
-
         telemetry.stage("user_memory_retrieve").notes["count"] = len(facts)
-        if facts:
-            logger.info("[user_memory] Retrieved %d fact(s) for user.", len(facts))
         return facts
-
-    # ---- Write path (async) -------------------------------------------
 
     def schedule_extraction(
         self,
         user_id: Optional[str],
         user_message: str,
         assistant_message: str,
+        tenant_id: Optional[str] = None,
     ) -> None:
-        """
-        Fire-and-forget extraction. Runs in a background thread so the user's
-        response isn't delayed. Errors are logged but never raised.
-        """
         if not self.enabled or not user_id:
             return
         if not user_message or not assistant_message:
             return
 
-        def _run() -> None:
+        async def _run() -> None:
             try:
-                facts = self.extractor.extract(user_message, assistant_message)
+                facts = await self.extractor.extract(user_message, assistant_message)
                 if facts:
-                    added = self.store.add_facts(user_id, facts)
+                    added = await self.store.add_facts(user_id, facts, tenant_id)
                     if added:
-                        logger.info(
-                            "[user_memory] Stored %d new fact(s) for user.", added
-                        )
+                        logger.info("[user_memory] Stored %d fact(s).", added)
             except Exception as exc:
-                # Defensive — extractor + store already swallow their errors,
-                # but a process-wide background failure should never propagate.
                 logger.warning("[user_memory] Background extraction failed: %s", exc)
 
-        try:
-            self._extraction_pool.submit(_run)
-        except RuntimeError:
-            # Pool is shut down — happens during graceful shutdown. Skip silently.
-            logger.debug("[user_memory] Skipped extraction; pool shut down.")
-
-    # ---- Context formatting ------------------------------------------
+        task = asyncio.create_task(_run())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     @staticmethod
     def format_for_prompt(facts: list[RetrievedFact]) -> str:
-        """Render retrieved facts as the user_context_block for the answer prompt."""
         if not facts:
             return ""
         bullets = "\n".join(f"- {f.text}" for f in facts)
         return f"{USER_MEMORY_CONTEXT_HEADER}\n{bullets}\n"
 
-    # ---- Optional management ops -------------------------------------
-
-    def clear_user(self, user_id: str) -> None:
-        """For 'forget me' / GDPR-style user-initiated wipes."""
-        try:
-            store = self.store._get_store(user_id)
-            # Chroma doesn't expose collection-drop neatly; delete by metadata.
-            store.delete(where={"user_id": user_id})
-            logger.info("[user_memory] Cleared all facts for user.")
-        except Exception as exc:
-            logger.warning("[user_memory] Failed to clear user: %s", exc)
+    async def clear_user(
+        self, user_id: str, tenant_id: Optional[str] = None
+    ) -> None:
+        n = await self.store.clear_user(user_id, tenant_id)
+        logger.info("[user_memory] Cleared %d fact(s) for user.", n)
