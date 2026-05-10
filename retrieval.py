@@ -1,101 +1,55 @@
 """
-Retrieval subsystem.
+Retrieval subsystem — async-first, Qdrant-backed, native sparse+dense hybrid.
 
-Architecture (after split):
-  - RetrieverIndex      : owns infrastructure (Chroma, BM25, cross-encoder).
-                          Lazy-loads, handles corpus drift, threadsafe.
-                          Knows nothing about algorithms.
-  - HybridRetriever     : pure retrieval algorithm. Takes a RetrieverIndex,
-                          runs BM25 + Vector + RRF + rerank + budget cap.
-                          Stateless w.r.t. infrastructure.
-  - QueryAnalyzer       : query classification + HyDE generation.
-  - WebSearcher         : Tavily-backed web search with query rewriting.
+Architecture:
+  - QdrantRetrieverIndex   : owns the Qdrant client, sparse+dense embedders,
+                             cross-encoder. Lazy collection check on first use.
+  - HybridRetriever        : pure algorithm. Calls native Qdrant Query API
+                             with prefetch + RRF fusion + metadata filters,
+                             then optional cross-encoder rerank, optional
+                             parent-child expansion, then token budget cap.
+  - QueryAnalyzer          : query classification + HyDE generation.
+  - WebSearcher            : Tavily web search with query rewriting.
 
-Why this split:
-  - Index lifecycle (init, drift detection, locking) and retrieval algorithm
-    (BM25, RRF, rerank) are unrelated concerns that were tangled in one class.
-  - Tests can now stub a fake RetrieverIndex without spinning up Chroma.
-  - Future swap: replace RetrieverIndex with an OpenSearch-backed version
-    without touching the algorithm.
-
-Pipeline flow (in HybridRetriever.retrieve):
-  1. analyze(question)              -> factual | conceptual | procedural
-  2. maybe_hyde(question, category) -> embedding query (raw or HyDE passage)
-  3. parallel: bm25(question), vector(embedding_query)
-  4. rrf_fuse(bm25, vector, k=60)   -> fused ranked list
-  5. cross_encoder_rerank(top_n)    -> final ordered docs
-  6. truncate_to_token_budget       -> final docs within token budget
+Hybrid search is delegated to Qdrant (Query API with FusionQuery.RRF)
+instead of being computed in Python — fewer round-trips, native scoring.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import threading
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
-from langchain_chroma import Chroma
+from fastembed import SparseTextEmbedding
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.http import models as qm
 
+from .cache import RetrievalCache
 from .config import CRAGConfig
 from .llm import LLMClients
 from .observability import TelemetryCollector
-from .prompts import HYDE_PROMPT, QUERY_CLASSIFIER_PROMPT
+from .prompts import HYDE_PROMPT, QUERY_CLASSIFIER_PROMPT, QUERY_REWRITE_PROMPT
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Reciprocal Rank Fusion — pure function
-# ============================================================================
-
-def reciprocal_rank_fusion(
-    ranked_lists: list[list[Document]],
-    k: int = 60,
-) -> list[tuple[Document, float, dict[int, int]]]:
-    """
-    Combine multiple ranked lists via RRF.
-
-    Returns list of (doc, fused_score, {list_index: rank_in_that_list}) tuples,
-    sorted by fused_score descending. Per-list ranks are returned for
-    observability — you can see which retriever contributed each result.
-
-    Doc identity is determined by page_content (after strip). Metadata is
-    taken from the first list a doc appears in.
-    """
-    scores: dict[str, float] = {}
-    docs: dict[str, Document] = {}
-    contributions: dict[str, dict[int, int]] = {}
-
-    for list_idx, ranked in enumerate(ranked_lists):
-        for rank, doc in enumerate(ranked, start=1):
-            key = doc.page_content.strip()
-            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
-            docs.setdefault(key, doc)
-            contributions.setdefault(key, {})[list_idx] = rank
-
-    fused = sorted(
-        ((docs[key], score, contributions[key]) for key, score in scores.items()),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    return fused
-
-
-# ============================================================================
-# Pure helpers — no state
+# Pure helpers
 # ============================================================================
 
 def deduplicate_docs(docs: list[Document]) -> list[Document]:
-    """Remove docs with duplicate page_content, preserving order."""
+    """Remove docs with duplicate (chunk_id, page_content) keys, preserving order."""
     seen: set[str] = set()
     out: list[Document] = []
     for doc in docs:
-        key = doc.page_content.strip()
+        chunk_id = doc.metadata.get("chunk_id") or ""
+        key = f"{chunk_id}::{doc.page_content.strip()}"
         if key and key not in seen:
             seen.add(key)
             out.append(doc)
@@ -103,14 +57,12 @@ def deduplicate_docs(docs: list[Document]) -> list[Document]:
 
 
 def _approx_tokens(text: str) -> int:
-    """Conservative approximation: 1 token ≈ 4 chars. Avoids tiktoken dependency."""
     return len(text) // 4
 
 
 def truncate_to_token_budget(
     docs: list[Document], max_tokens: int
 ) -> tuple[list[Document], bool]:
-    """Drop docs from the end until total tokens fit. Returns (kept, truncated)."""
     kept: list[Document] = []
     used = 0
     truncated = False
@@ -124,192 +76,265 @@ def truncate_to_token_budget(
     return kept, truncated
 
 
+def build_qdrant_filter(
+    filters: Optional[dict[str, Any]],
+    tenant_id: Optional[str],
+    children_only: bool,
+) -> Optional[qm.Filter]:
+    """Compose a Qdrant Filter from user-facing filter dict + tenant + structural flags."""
+    must: list[qm.FieldCondition] = []
+
+    if tenant_id is not None:
+        must.append(qm.FieldCondition(
+            key="tenant_id", match=qm.MatchValue(value=tenant_id)
+        ))
+
+    if children_only:
+        must.append(qm.FieldCondition(
+            key="is_parent", match=qm.MatchValue(value=False)
+        ))
+
+    if filters:
+        for k, v in filters.items():
+            if isinstance(v, list):
+                must.append(qm.FieldCondition(key=k, match=qm.MatchAny(any=v)))
+            elif isinstance(v, dict) and ("gte" in v or "lte" in v):
+                must.append(qm.FieldCondition(
+                    key=k,
+                    range=qm.Range(gte=v.get("gte"), lte=v.get("lte")),
+                ))
+            else:
+                must.append(qm.FieldCondition(key=k, match=qm.MatchValue(value=v)))
+
+    return qm.Filter(must=must) if must else None
+
+
+def _point_to_document(point: Any) -> Document:
+    payload = point.payload or {}
+    content = payload.pop("content", "")
+    metadata = dict(payload)
+    metadata["chunk_id"] = str(point.id)
+    metadata["score"] = float(getattr(point, "score", 0.0) or 0.0)
+    return Document(page_content=content, metadata=metadata)
+
+
 # ============================================================================
-# RetrieverIndex — owns infrastructure, knows nothing about algorithms
+# QdrantRetrieverIndex
 # ============================================================================
 
-class RetrieverIndex:
+class QdrantRetrieverIndex:
     """
-    Owns the Chroma vector store, the BM25 index, and the cross-encoder model.
+    Owns Qdrant async client, dense embeddings, sparse model, cross-encoder.
 
-    Single responsibility: keep the search infrastructure alive and fresh.
-    Provides cheap accessors for the algorithmic layer to use.
-
-    Lifecycle:
-      - Lazy init on first access (so importing the module doesn't require
-        a live DB).
-      - Threadsafe via Lock — concurrent first-call from multiple threads
-        won't double-build.
-      - Drift detection: if Chroma's corpus size drifts >20% from the build-
-        time snapshot, the BM25 index is stale and gets rebuilt.
-
-    Why this is a separate class:
-      - Mixing infrastructure setup with algorithms made HybridRetriever
-        ~150 lines. Splitting them out leaves both classes < 100L.
-      - Tests can stub this class entirely without touching Chroma.
-      - Future migration to OpenSearch / managed BM25 only touches this file.
+    Single responsibility: keep search infrastructure alive, ensure the target
+    collection exists, expose typed search primitives. Knows nothing about
+    ranking algorithms or pipeline policy.
     """
-
-    DRIFT_THRESHOLD = 0.20  # 20% corpus drift triggers rebuild
 
     def __init__(self, cfg: CRAGConfig, clients: LLMClients):
         self.cfg = cfg
         self.clients = clients
-        self._lock = threading.Lock()
-        self._vector_store: Optional[Chroma] = None
-        self._bm25: Optional[BM25Retriever] = None
+        self._client: Optional[AsyncQdrantClient] = None
+        self._sparse: Optional[SparseTextEmbedding] = None
         self._cross_encoder: Optional[HuggingFaceCrossEncoder] = None
-        self._corpus_size: int = 0
+        self._init_lock = asyncio.Lock()
+        self._collection_ready = False
 
     # ---- Lifecycle ----------------------------------------------------
 
-    def ensure_ready(self) -> None:
-        """
-        Build the index if not yet built. Rebuild if corpus drifted.
-        Cheap to call repeatedly — most calls are no-ops after init.
-        """
-        if self._is_fresh():
+    async def ensure_ready(self) -> None:
+        if self._collection_ready and self._client is not None:
             return
-        with self._lock:
-            if self._is_fresh():
-                return  # another thread did it
-            self._build()
-
-    def _is_fresh(self) -> bool:
-        if self._bm25 is None or self._vector_store is None:
-            return False
-        try:
-            current = self._vector_store._collection.count()
-        except Exception:
-            return True   # if we can't check, trust the existing index
-        if not self._corpus_size:
-            return True
-        drift = abs(current - self._corpus_size) / self._corpus_size
-        if drift > self.DRIFT_THRESHOLD:
-            logger.info(
-                "[index] Corpus drifted %d -> %d (%.0f%%) — rebuild required.",
-                self._corpus_size, current, drift * 100,
+        async with self._init_lock:
+            if self._collection_ready and self._client is not None:
+                return
+            self._client = AsyncQdrantClient(
+                url=self.cfg.qdrant_url,
+                api_key=self.cfg.qdrant_api_key,
+                prefer_grpc=self.cfg.qdrant_prefer_grpc,
             )
-            return False
-        return True
+            await self._ensure_collection()
+            if self._sparse is None:
+                self._sparse = SparseTextEmbedding(model_name=self.cfg.sparse_model)
+            if self._cross_encoder is None:
+                self._cross_encoder = HuggingFaceCrossEncoder(
+                    model_name=self.cfg.cross_encoder_model
+                )
+            self._collection_ready = True
 
-    def _build(self) -> None:
-        logger.info("[index] Building hybrid retriever index...")
-        store = Chroma(
-            persist_directory=self.cfg.chroma_dir,
-            embedding_function=self.clients.embeddings,
+    async def _ensure_collection(self) -> None:
+        assert self._client is not None
+        exists = await self._client.collection_exists(self.cfg.qdrant_collection)
+        if exists:
+            return
+        logger.info(
+            "[index] Creating Qdrant collection '%s'", self.cfg.qdrant_collection
         )
-        data = store.get(include=["documents", "metadatas"])
-        docs = [
-            Document(page_content=t, metadata=m or {})
-            for t, m in zip(data["documents"], data["metadatas"])
-        ]
-        if not docs:
-            raise RuntimeError(
-                f"ChromaDB at '{self.cfg.chroma_dir}' is empty. "
-                "Run your ingest pipeline first."
-            )
-        bm25 = BM25Retriever.from_documents(docs)
-        bm25.k = self.cfg.bm25_k
-
-        self._vector_store = store
-        self._bm25 = bm25
-        self._corpus_size = len(docs)
-
-        if self._cross_encoder is None:
-            self._cross_encoder = HuggingFaceCrossEncoder(
-                model_name=self.cfg.cross_encoder_model
-            )
-        logger.info("[index] Built. Corpus size: %d docs.", len(docs))
-
-    # ---- Search primitives --------------------------------------------
-
-    def bm25_search(self, question: str) -> list[Document]:
-        self.ensure_ready()
-        assert self._bm25 is not None
-        return self._bm25.invoke(question)
-
-    def vector_search(self, query_text: str) -> list[Document]:
-        self.ensure_ready()
-        assert self._vector_store is not None
-        retriever = self._vector_store.as_retriever(
-            search_type="mmr",
-            search_kwargs={
-                "k": self.cfg.vector_k,
-                "fetch_k": self.cfg.vector_fetch_k,
-                "lambda_mult": self.cfg.vector_lambda,
+        await self._client.create_collection(
+            collection_name=self.cfg.qdrant_collection,
+            vectors_config={
+                "dense": qm.VectorParams(
+                    size=self.cfg.embedding_dim, distance=qm.Distance.COSINE
+                ),
+            },
+            sparse_vectors_config={
+                "sparse": qm.SparseVectorParams(
+                    index=qm.SparseIndexParams(on_disk=False)
+                ),
             },
         )
-        return retriever.invoke(query_text)
+        # Indexes for filtering
+        for field, schema in [
+            ("tenant_id", qm.PayloadSchemaType.KEYWORD),
+            ("source", qm.PayloadSchemaType.KEYWORD),
+            ("parent_id", qm.PayloadSchemaType.KEYWORD),
+            ("is_parent", qm.PayloadSchemaType.BOOL),
+        ]:
+            try:
+                await self._client.create_payload_index(
+                    collection_name=self.cfg.qdrant_collection,
+                    field_name=field,
+                    field_schema=schema,
+                )
+            except Exception as exc:
+                logger.debug("Payload index %s exists or skipped: %s", field, exc)
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                pass
+
+    # ---- Embedders ----------------------------------------------------
+
+    async def embed_dense(self, text: str) -> list[float]:
+        return await self.clients.embeddings.aembed_query(text)
+
+    def embed_sparse(self, text: str) -> qm.SparseVector:
+        assert self._sparse is not None
+        result = next(iter(self._sparse.embed([text])))
+        return qm.SparseVector(
+            indices=result.indices.tolist(), values=result.values.tolist()
+        )
+
+    # ---- Search primitives -------------------------------------------
+
+    async def hybrid_search(
+        self,
+        question: str,
+        vector_query_text: str,
+        limit: int,
+        prefetch_dense_k: int,
+        prefetch_sparse_k: int,
+        rrf_k: int,
+        query_filter: Optional[qm.Filter],
+    ) -> list[Document]:
+        """
+        Native Qdrant hybrid: dense prefetch + sparse prefetch + RRF fusion.
+        BM25-equivalent without keeping a Python BM25 index in process RAM.
+        """
+        await self.ensure_ready()
+        assert self._client is not None
+
+        dense_vec = await self.embed_dense(vector_query_text)
+        sparse_vec = self.embed_sparse(question)
+
+        response = await self._client.query_points(
+            collection_name=self.cfg.qdrant_collection,
+            prefetch=[
+                qm.Prefetch(
+                    query=dense_vec, using="dense", limit=prefetch_dense_k,
+                    filter=query_filter,
+                ),
+                qm.Prefetch(
+                    query=sparse_vec, using="sparse", limit=prefetch_sparse_k,
+                    filter=query_filter,
+                ),
+            ],
+            query=qm.FusionQuery(fusion=qm.Fusion.RRF),
+            limit=limit,
+            query_filter=query_filter,
+            with_payload=True,
+        )
+        return [_point_to_document(p) for p in response.points]
+
+    async def fetch_by_ids(self, ids: list[str]) -> list[Document]:
+        await self.ensure_ready()
+        assert self._client is not None
+        if not ids:
+            return []
+        result = await self._client.retrieve(
+            collection_name=self.cfg.qdrant_collection,
+            ids=ids,
+            with_payload=True,
+        )
+        return [_point_to_document(p) for p in result]
 
     def cross_encoder_score(
         self, question: str, docs: list[Document]
     ) -> list[float]:
-        """Score (question, doc) pairs. Returns scores in input order."""
-        self.ensure_ready()
         if not docs or self._cross_encoder is None:
             return []
-        pairs = [(question, doc.page_content) for doc in docs]
+        pairs = [(question, d.page_content) for d in docs]
         return list(self._cross_encoder.score(pairs))
 
 
 # ============================================================================
-# QueryAnalyzer — query classification + HyDE
+# QueryAnalyzer
 # ============================================================================
 
 @dataclass
 class QueryShape:
-    category: str          # "factual" | "conceptual" | "procedural"
+    category: str
     use_hyde: bool
     hyde_passage: Optional[str] = None
 
 
 class QueryAnalyzer:
-    """
-    Classifies questions and (conditionally) generates HyDE passages.
-    Caches classifications via LRU; HyDE passages are not cached (generative).
-    """
-
     def __init__(self, cfg: CRAGConfig, clients: LLMClients):
         self.cfg = cfg
         self.clients = clients
         self._classify_chain = QUERY_CLASSIFIER_PROMPT | clients.fast | StrOutputParser()
         self._hyde_chain = HYDE_PROMPT | clients.fast | StrOutputParser()
         self._classify_cached = lru_cache(maxsize=cfg.hyde_classifier_cache_size)(
-            self._classify_uncached
+            self._classify_sync_marker
         )
 
-    def _classify_uncached(self, question: str) -> str:
+    def _classify_sync_marker(self, question: str) -> str:  # only used as cache key
+        return question
+
+    async def _classify(self, question: str) -> str:
         try:
-            raw = self._classify_chain.invoke({"question": question}).strip().lower()
+            raw = await self._classify_chain.ainvoke({"question": question})
+            raw = (raw or "").strip().lower()
             if raw in ("factual", "conceptual", "procedural"):
                 return raw
         except Exception as exc:
-            logger.warning("Query classifier failed: %s — defaulting to factual.", exc)
+            logger.warning("Classifier failed: %s — defaulting to factual.", exc)
         return "factual"
 
-    def analyze(
+    async def analyze(
         self, question: str, telemetry: TelemetryCollector
     ) -> QueryShape:
         if not self.cfg.hyde_enabled:
             return QueryShape(category="factual", use_hyde=False)
 
-        with telemetry.time_stage("classify"):
-            category = self._classify_cached(question)
+        async with telemetry.atime_stage("classify"):
+            category = await self._classify(question)
             telemetry.record_llm_call("classify")
 
-        # HyDE helps on conceptual/procedural, neutral-to-harmful on factual.
         use_hyde = category in ("conceptual", "procedural")
         passage: Optional[str] = None
         if use_hyde:
-            with telemetry.time_stage("hyde"):
+            async with telemetry.atime_stage("hyde"):
                 try:
-                    passage = self._hyde_chain.invoke({"question": question}).strip()
+                    passage = (await self._hyde_chain.ainvoke({"question": question})).strip()
                     telemetry.record_llm_call("hyde")
                     if not passage:
                         use_hyde = False
                 except Exception as exc:
-                    logger.warning("HyDE generation failed: %s", exc)
+                    logger.warning("HyDE failed: %s", exc)
                     use_hyde = False
 
         telemetry.stage("classify").notes["category"] = category
@@ -318,116 +343,155 @@ class QueryAnalyzer:
 
 
 # ============================================================================
-# HybridRetriever — pure algorithm, no infrastructure ownership
+# HybridRetriever
 # ============================================================================
 
 class HybridRetriever:
-    """
-    Hybrid retrieval algorithm.
-
-    Composition:
-      RetrieverIndex (infra) + QueryAnalyzer (HyDE)
-      -> BM25 + Vector -> RRF -> Cross-encoder rerank -> Token budget cap
-
-    This class holds NO infrastructure state. The index is the source of truth
-    for Chroma/BM25/cross-encoder; this class just orchestrates calls to it.
-    """
-
     def __init__(
         self,
         cfg: CRAGConfig,
-        index: RetrieverIndex,
+        index: QdrantRetrieverIndex,
         analyzer: QueryAnalyzer,
+        cache: RetrievalCache,
     ):
         self.cfg = cfg
         self.index = index
         self.analyzer = analyzer
+        self.cache = cache
 
-    def _rerank(
+    async def _rerank(
         self, question: str, docs: list[Document]
     ) -> list[Document]:
-        """Cross-encoder rerank, top-N. Returns input order if scoring fails."""
         if not docs:
             return []
-        scores = self.index.cross_encoder_score(question, docs)
+        # cross-encoder is sync/CPU; offload to thread to avoid blocking loop
+        scores = await asyncio.to_thread(
+            self.index.cross_encoder_score, question, docs
+        )
         if not scores:
             return docs[: self.cfg.cross_encoder_top_n]
         ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-        return [doc for doc, _ in ranked[: self.cfg.cross_encoder_top_n]]
+        return [d for d, _ in ranked[: self.cfg.cross_encoder_top_n]]
 
-    def retrieve(
+    async def _expand_to_parents(
+        self, child_docs: list[Document]
+    ) -> list[Document]:
+        """Replace child docs with their parents where parent_id is set."""
+        if not self.cfg.parent_child_expansion:
+            return child_docs
+
+        parent_ids: list[str] = []
+        seen: set[str] = set()
+        for doc in child_docs:
+            pid = doc.metadata.get("parent_id")
+            if pid and pid not in seen:
+                parent_ids.append(pid)
+                seen.add(pid)
+
+        if not parent_ids:
+            return child_docs
+
+        parents = await self.index.fetch_by_ids(parent_ids)
+        # Preserve ranking order: emit each child's parent the first time we see it.
+        parent_by_id = {p.metadata.get("chunk_id"): p for p in parents}
+        out: list[Document] = []
+        emitted: set[str] = set()
+        for doc in child_docs:
+            pid = doc.metadata.get("parent_id")
+            if pid and pid in parent_by_id and pid not in emitted:
+                out.append(parent_by_id[pid])
+                emitted.add(pid)
+            elif not pid:
+                out.append(doc)
+        return out
+
+    async def retrieve(
         self,
         question: str,
         telemetry: TelemetryCollector,
+        filters: Optional[dict[str, Any]] = None,
+        tenant_id: Optional[str] = None,
     ) -> list[Document]:
-        """
-        Full retrieval flow. Returns final ranked docs, capped at
-        cross_encoder_top_n and within max_context_tokens budget.
-        """
-        # 1. Analyze query — pick HyDE strategy.
-        shape = self.analyzer.analyze(question, telemetry)
+        # ---- Cache lookup
+        cache_filters = {"filters": filters, "tenant_id": tenant_id}
+        cached = await self.cache.get(question, cache_filters)
+        if cached is not None:
+            telemetry.record_cache("retrieve_total", hit=True)
+            telemetry.stage("retrieve_total").notes["cached"] = True
+            return cached
+        telemetry.record_cache("retrieve_total", hit=False)
+
+        # ---- Analyze
+        shape = await self.analyzer.analyze(question, telemetry)
         vector_query = (
             shape.hyde_passage if (shape.use_hyde and shape.hyde_passage) else question
         )
 
-        # 2. Run BM25 + vector retrieval.
-        with telemetry.time_stage("retrieve_bm25"):
-            bm25_results = self.index.bm25_search(question)
-        with telemetry.time_stage("retrieve_vector"):
-            vector_results = self.index.vector_search(vector_query)
+        qfilter = build_qdrant_filter(filters, tenant_id, children_only=True)
 
-        telemetry.stage("retrieve_bm25").notes["count"] = len(bm25_results)
-        telemetry.stage("retrieve_vector").notes["count"] = len(vector_results)
-        telemetry.stage("retrieve_vector").notes["hyde_used"] = shape.use_hyde
-
-        # 3. RRF fusion.
-        with telemetry.time_stage("rrf_fusion"):
-            fused = reciprocal_rank_fusion(
-                [bm25_results, vector_results], k=self.cfg.rrf_k
+        # ---- Hybrid retrieval (native RRF in Qdrant)
+        async with telemetry.atime_stage("hybrid_search"):
+            fetch_k = max(
+                self.cfg.vector_fetch_k + self.cfg.sparse_k,
+                self.cfg.cross_encoder_top_n * 4,
             )
-            fused_docs = [doc for doc, _, _ in fused]
-        telemetry.stage("rrf_fusion").notes["fused_count"] = len(fused_docs)
+            fused = await self.index.hybrid_search(
+                question=question,
+                vector_query_text=vector_query,
+                limit=fetch_k,
+                prefetch_dense_k=self.cfg.vector_fetch_k,
+                prefetch_sparse_k=self.cfg.sparse_k,
+                rrf_k=self.cfg.rrf_k,
+                query_filter=qfilter,
+            )
+        telemetry.stage("hybrid_search").notes["count"] = len(fused)
+        telemetry.stage("hybrid_search").notes["hyde_used"] = shape.use_hyde
 
-        # 4. Cross-encoder rerank on the top of the fused list.
-        rerank_input = fused_docs[: self.cfg.vector_fetch_k + self.cfg.bm25_k]
-        with telemetry.time_stage("rerank"):
-            reranked = self._rerank(question, rerank_input)
+        # ---- Rerank
+        async with telemetry.atime_stage("rerank"):
+            reranked = await self._rerank(question, fused)
         telemetry.stage("rerank").notes["count"] = len(reranked)
 
-        # 5. Token budget.
+        # ---- Parent-child expansion
+        if self.cfg.parent_child_expansion:
+            async with telemetry.atime_stage("parent_expand"):
+                expanded = await self._expand_to_parents(reranked)
+            telemetry.stage("parent_expand").notes["count"] = len(expanded)
+        else:
+            expanded = reranked
+
+        # ---- Token budget
         kept, truncated = truncate_to_token_budget(
-            reranked, self.cfg.max_context_tokens
+            expanded, self.cfg.max_context_tokens
         )
         if truncated:
             telemetry.stage("rerank").notes["truncated_for_budget"] = True
-            logger.info(
-                "[retrieval] Context truncated for token budget: kept %d/%d docs.",
-                len(kept), len(reranked),
-            )
+
+        # ---- Cache store
+        await self.cache.set(question, kept, cache_filters)
         return kept
 
 
 # ============================================================================
-# WebSearcher — Tavily + query rewriting
+# WebSearcher
 # ============================================================================
 
 class WebSearcher:
-    """Tavily-backed web search with query rewriting."""
-
     def __init__(self, cfg: CRAGConfig, clients: LLMClients):
         from langchain_community.tools.tavily_search import TavilySearchResults
-        from .prompts import QUERY_REWRITE_PROMPT
 
         self.cfg = cfg
         self._tool = TavilySearchResults(max_results=cfg.web_search_max_results)
         self._rewrite_chain = QUERY_REWRITE_PROMPT | clients.fast | StrOutputParser()
 
-    def search(
+    async def search(
         self, question: str, telemetry: TelemetryCollector
     ) -> list[Document]:
-        with telemetry.time_stage("web_rewrite"):
+        async with telemetry.atime_stage("web_rewrite"):
             try:
-                rewritten = self._rewrite_chain.invoke({"question": question}).strip()
+                rewritten = (
+                    await self._rewrite_chain.ainvoke({"question": question})
+                ).strip()
                 telemetry.record_llm_call("web_rewrite")
             except Exception as exc:
                 logger.warning("Query rewriter failed: %s", exc)
@@ -436,13 +500,12 @@ class WebSearcher:
                 rewritten = question
 
         telemetry.stage("web_rewrite").notes["query"] = rewritten
-        logger.info("[retrieval] Web search query: '%s'", rewritten)
 
-        with telemetry.time_stage("web_search"):
+        async with telemetry.atime_stage("web_search"):
             try:
-                results = self._tool.invoke(rewritten)
+                results = await self._tool.ainvoke(rewritten)
             except Exception as exc:
-                logger.warning("[retrieval] Web search failed: %s", exc)
+                logger.warning("Web search failed: %s", exc)
                 return []
 
         docs: list[Document] = []
@@ -450,16 +513,9 @@ class WebSearcher:
             content = r.get("content") or r.get("snippet") or ""
             url = r.get("url", "unknown")
             if content:
-                docs.append(
-                    Document(
-                        page_content=content,
-                        metadata={"source": url, "page": "web", "provenance": "web"},
-                    )
-                )
-        if not docs:
-            logger.warning(
-                "[retrieval] Web search returned no usable results for: '%s'",
-                rewritten,
-            )
+                docs.append(Document(
+                    page_content=content,
+                    metadata={"source": url, "page": "web", "provenance": "web"},
+                ))
         telemetry.stage("web_search").notes["count"] = len(docs)
         return docs
