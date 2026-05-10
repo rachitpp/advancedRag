@@ -1,42 +1,29 @@
 """
-CRAG pipeline orchestrator.
+CRAG pipeline orchestrator. Async-first.
 
-This module is deliberately thin — all real logic lives in retrieval/, grading/,
-verification/, conversation/, and user_memory/. The orchestrator's job is to:
-  1. Hold the subsystems together
-  2. Implement the graded router
-  3. Stream the answer to a caller-supplied callback
-  4. Assemble the CRAGResult
-  5. Coordinate memory: rewrite query (conversational), inject facts (user),
-     record the turn (both), schedule extraction (user, async).
+Responsibilities:
+  1. Hold subsystems together.
+  2. Implement the graded router.
+  3. Stream the answer via async generator OR via on_token callback.
+  4. Coordinate two-tier memory.
+  5. Assemble CRAGResult with telemetry.
 
-Threading model:
-  - Three ThreadPoolExecutors: chunk grading, claim verification, memory extraction.
-  - Created at CRAGPipeline construction, shut down via .close() (or context mgr).
-  - NOT module-level globals — caller owns the lifecycle.
-
-Memory model:
-  - Both tiers are OPTIONAL. Pipeline runs identically without them.
-  - Conversational memory: pass session_id to enable per-session history.
-  - User memory: pass user_id AND set cfg.user_memory_enabled=True.
-  - Either can be None — pipeline degrades gracefully.
-
-Streaming model:
-  - run_query takes an optional on_token callback.
-  - Defaults to a no-op so HTTP API callers don't need to think about it.
-  - CLI passes a stdout-writer adapter.
+Concurrency model: bounded async via asyncio.Semaphore for grading and
+claim verification; background fact extraction via tracked task set
+drained on close().
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Union
 
 from langchain_core.documents import Document
 from langsmith import traceable
 
+from .cache import RetrievalCache
 from .config import CRAGConfig
 from .conversation import (
     Conversation,
@@ -50,22 +37,27 @@ from .observability import FallbackReason, TelemetryCollector, extract_usage
 from .prompts import ANSWER_PROMPT
 from .retrieval import (
     HybridRetriever,
+    QdrantRetrieverIndex,
     QueryAnalyzer,
-    RetrieverIndex,
     WebSearcher,
     deduplicate_docs,
 )
-from .user_memory import RetrievedFact, UserMemoryManager
+from .user_memory import (
+    PostgresUserMemoryStore,
+    RetrievedFact,
+    UserMemoryManager,
+)
 from .verification import FaithfulnessVerifier, SelfCorrector
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------- Result type
+# ============================================================================
+# Result types
+# ============================================================================
 
 @dataclass
 class CRAGResult:
-    """Structured pipeline output. Caller-friendly, no LangSmith dependency to read."""
     answer: str
     faithfulness_score: float
     fallback_reason: FallbackReason = FallbackReason.NONE
@@ -73,13 +65,11 @@ class CRAGResult:
     self_corrected: bool = False
     correction_regressed: bool = False
     source_docs: list[Document] = field(default_factory=list)
-
-    # ---- Memory metadata (populated when memory is used) ----
-    standalone_question: Optional[str] = None     # post-rewrite, if rewritten
+    standalone_question: Optional[str] = None
     user_facts_used: list[str] = field(default_factory=list)
     session_id: Optional[str] = None
     user_id: Optional[str] = None
-
+    tenant_id: Optional[str] = None
     telemetry: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -87,10 +77,7 @@ class CRAGResult:
         return self.fallback_reason != FallbackReason.NONE
 
 
-# ---------------------------------------------------------------- Helpers
-
 def format_docs(docs: list[Document]) -> str:
-    """Format docs with provenance — used both for generation AND verification."""
     parts = []
     for i, doc in enumerate(docs, 1):
         src = doc.metadata.get("source", "unknown")
@@ -99,25 +86,34 @@ def format_docs(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-OnToken = Callable[[str], None]
+OnToken = Callable[[str], Union[None, Awaitable[None]]]
+
+
+async def _maybe_await(value: Union[None, Awaitable[None]]) -> None:
+    if asyncio.iscoroutine(value) or isinstance(value, Awaitable):
+        await value  # type: ignore[arg-type]
 
 
 def _noop_on_token(_token: str) -> None:
-    pass
+    return None
 
 
-# ---------------------------------------------------------------- Pipeline
+# ============================================================================
+# Pipeline
+# ============================================================================
 
 class CRAGPipeline:
     """
-    Owns the subsystems and exposes run_query.
+    Owns subsystems, exposes async run_query and astream_query.
 
-    Use as a context manager OR call .close() explicitly to shut down thread pools.
+    Use as an async context manager:
+        async with CRAGPipeline(cfg) as pipeline:
+            result = await pipeline.run_query("...")
 
-    Memory:
-      - Pass session_id to enable conversational memory for that session.
-      - Pass user_id to enable user memory (also requires cfg.user_memory_enabled).
-      - Both default to None — pipeline runs as a stateless QA system.
+    Streaming:
+        async for chunk in pipeline.astream_query("..."):
+            if isinstance(chunk, str): print(chunk, end="")
+            else: result = chunk  # final CRAGResult
     """
 
     def __init__(
@@ -125,175 +121,152 @@ class CRAGPipeline:
         cfg: CRAGConfig,
         clients: Optional[LLMClients] = None,
         conversation_store: Optional[ConversationStore] = None,
+        user_memory_store: Optional[PostgresUserMemoryStore] = None,
     ):
         self.cfg = cfg
         self.clients = clients or LLMClients.from_config(cfg)
 
-        # ---- Core subsystems ----
-        # Retrieval is split: index owns infrastructure, retriever owns algorithm.
-        self.index = RetrieverIndex(cfg, self.clients)
+        # Cache + retrieval infra
+        self.cache = RetrievalCache.from_config(cfg)
+        self.index = QdrantRetrieverIndex(cfg, self.clients)
         self.query_analyzer = QueryAnalyzer(cfg, self.clients)
-        self.retriever = HybridRetriever(cfg, self.index, self.query_analyzer)
+        self.retriever = HybridRetriever(cfg, self.index, self.query_analyzer, self.cache)
         self.web_searcher = WebSearcher(cfg, self.clients)
         self.grader = ChunkGrader(cfg, self.clients)
 
-        # Verification is split: verifier scores, corrector decides.
+        # Verification
         self.verifier = FaithfulnessVerifier(cfg, self.clients)
         self.corrector = SelfCorrector(cfg, self.clients, self.verifier)
 
-        # ---- Memory subsystems ----
+        # Conversation memory
         self.conversation_manager = ConversationManager(cfg, store=conversation_store)
         self.query_rewriter = ConversationalQueryRewriter(cfg, self.clients)
 
-        # ---- Thread pools (lifecycle owned here) ----
-        self._chunk_pool = ThreadPoolExecutor(
-            max_workers=cfg.max_chunk_workers, thread_name_prefix="crag-chunk"
+        # User memory (Postgres)
+        self.user_memory_store = user_memory_store or PostgresUserMemoryStore(
+            cfg, self.clients
         )
-        self._claim_pool = ThreadPoolExecutor(
-            max_workers=cfg.max_claim_workers, thread_name_prefix="crag-claim"
-        )
-        # Memory extraction runs on its own small pool. Kept separate from
-        # claim/chunk pools because memory work happens AFTER the response is
-        # returned and shouldn't compete with in-flight pipeline work.
-        self._memory_pool = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="crag-memory"
-        )
-
+        self._background_tasks: set[asyncio.Task] = set()
         self.user_memory = UserMemoryManager(
-            cfg, self.clients, extraction_pool=self._memory_pool
+            cfg, self.clients, self.user_memory_store, self._background_tasks
         )
 
-    # ---- Lifecycle -----------------------------------------------------
+        # Concurrency primitives
+        self._chunk_sem = asyncio.Semaphore(cfg.max_chunk_concurrency)
+        self._claim_sem = asyncio.Semaphore(cfg.max_claim_concurrency)
 
-    def close(self, wait: bool = True) -> None:
-        """Shut down thread pools. Call from app shutdown handler or use `with`."""
-        self._chunk_pool.shutdown(wait=wait)
-        self._claim_pool.shutdown(wait=wait)
-        # Always wait for in-flight memory extractions — losing them silently
-        # would mean the user "told" the system something it never remembered.
-        self._memory_pool.shutdown(wait=True)
+    # ---- Lifecycle ----
 
-    def __enter__(self) -> "CRAGPipeline":
+    async def aclose(self) -> None:
+        # Drain background fact-extraction so user-said-X is persisted.
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        await self.cache.aclose()
+        await self.index.aclose()
+        await self.user_memory_store.aclose()
+        await self.clients.aclose()
+
+    async def __aenter__(self) -> "CRAGPipeline":
         return self
 
-    def __exit__(self, *_exc: Any) -> None:
-        self.close(wait=True)
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.aclose()
 
-    # ---- Routing -------------------------------------------------------
+    # ---- Routing ----
 
     def _route(self, local_grades: GradeReport) -> tuple[str, bool]:
-        """
-        Graded router. Returns (mode, used_web).
-          "local"  -> use local relevant_docs only
-          "web"    -> use web results only
-          "hybrid" -> combine local relevant + graded web
-        """
-        if local_grades.has_strong_local_signal:
+        if local_grades.has_strong_local_signal(self.cfg):
             return "local", False
         if local_grades.has_any_relevant:
             return "hybrid", True
         return "web", True
 
-    # ---- Generation ----------------------------------------------------
+    # ---- Generation ----
 
-    def _generate(
+    async def _generate_stream(
         self,
         question: str,
         labelled_context: str,
         user_context_block: str,
-        on_token: OnToken,
         telemetry: TelemetryCollector,
-    ) -> str:
-        """Stream the answer, accumulate, return full string."""
+    ) -> AsyncIterator[str]:
         prompt_value = ANSWER_PROMPT.invoke({
             "context": labelled_context,
             "question": question,
             "user_context_block": user_context_block,
         })
-
-        chunks: list[str] = []
         last_chunk: Any = None
-
-        with telemetry.time_stage("generate"):
-            for chunk in self.clients.main.stream(prompt_value):
-                content = chunk.content if hasattr(chunk, "content") else str(chunk)
+        tokens_in = tokens_out = 0
+        async with telemetry.atime_stage("generate"):
+            async for chunk in self.clients.main.astream(prompt_value):
+                content = getattr(chunk, "content", None)
                 if content:
-                    chunks.append(content)
-                    on_token(content)
+                    yield content
                 last_chunk = chunk
             telemetry.record_llm_call("generate")
-
         ti, to = extract_usage(last_chunk)
         if ti or to:
             telemetry.stage("generate").tokens_in += ti
             telemetry.stage("generate").tokens_out += to
+        _ = (tokens_in, tokens_out)  # silence unused
 
-        return "".join(chunks)
+    # ---- Public API: streaming generator ----
 
-    # ---- Public API: run_query ----------------------------------------
-
-    @traceable(name="crag.run_query", tags=["crag"])
-    def run_query(
+    @traceable(name="crag.astream_query", tags=["crag"])
+    async def astream_query(
         self,
         question: str,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
-        on_token: Optional[OnToken] = None,
-    ) -> CRAGResult:
+        tenant_id: Optional[str] = None,
+        filters: Optional[dict[str, Any]] = None,
+    ) -> AsyncIterator[Union[str, CRAGResult]]:
         """
-        Run the full CRAG pipeline for a single question.
+        Stream tokens as they're generated, then yield the final CRAGResult.
 
-        Args:
-          question:    user query (raw, possibly with pronouns / references)
-          session_id:  enables conversational memory if provided
-          user_id:     enables user memory if provided AND cfg.user_memory_enabled
-          on_token:    streaming callback; defaults to no-op
-
-        Memory flow:
-          1. Get-or-create conversation (if session_id given), record user msg
-          2. Rewrite question into standalone form using history
-          3. Retrieve user facts relevant to the standalone question
-          4. ...(normal CRAG pipeline using standalone_question for retrieval)...
-          5. Generate using ORIGINAL question + injected user facts
-          6. Record assistant message in conversation
-          7. Schedule async fact extraction from this turn (if non-fallback)
+        Note on streaming + verification: tokens are emitted during generation;
+        verification and self-correction happen after streaming completes. If
+        the answer fails verification, the FINAL yielded CRAGResult contains
+        the corrected (or fallback) answer, while the streamed text was the
+        original. Consumers should display the CRAGResult.answer as the
+        authoritative value once it arrives.
         """
-        on_token = on_token or _noop_on_token
         telemetry = TelemetryCollector()
 
-        # ---- Memory: setup conversation -----------------------------------
+        # ---- Memory setup
         conversation: Optional[Conversation] = None
         if session_id and self.cfg.conversation_enabled:
-            conversation = self.conversation_manager.get_or_create(
+            conversation = await self.conversation_manager.get_or_create(
                 session_id, user_id=user_id
             )
-            self.conversation_manager.record_user_message(conversation, question)
+            await self.conversation_manager.record_user_message(conversation, question)
 
-        # ---- Memory: rewrite follow-ups into standalone questions ---------
-        standalone_question = self.query_rewriter.rewrite(
+        standalone_question = await self.query_rewriter.rewrite(
             question, conversation, telemetry
         )
         was_rewritten = standalone_question != question
 
-        # ---- Memory: retrieve relevant user facts -------------------------
-        user_facts: list[RetrievedFact] = self.user_memory.retrieve_for_question(
+        user_facts: list[RetrievedFact] = await self.user_memory.retrieve_for_question(
             user_id=user_id,
             question=standalone_question,
             telemetry=telemetry,
+            tenant_id=tenant_id,
         )
         user_context_block = self.user_memory.format_for_prompt(user_facts)
 
-        # ---- 1. Local retrieval ------------------------------------------
-        with telemetry.time_stage("retrieve_total"):
-            local_docs = self.retriever.retrieve(standalone_question, telemetry)
+        # ---- Retrieve
+        async with telemetry.atime_stage("retrieve_total"):
+            local_docs = await self.retriever.retrieve(
+                standalone_question, telemetry,
+                filters=filters, tenant_id=tenant_id,
+            )
 
-        # ---- 2. Grade local docs -----------------------------------------
-        local_report = self.grader.grade(
-            local_docs, standalone_question, self._chunk_pool,
-            telemetry, label="local",
+        # ---- Grade
+        local_report = await self.grader.grade(
+            local_docs, standalone_question,
+            self._chunk_sem, telemetry, label="local",
         )
 
-        # ---- 3. Route ----------------------------------------------------
         mode, used_web = self._route(local_report)
         logger.info(
             "[router] mode=%s relevant=%d/%d mean_conf=%.2f",
@@ -301,32 +274,35 @@ class CRAGPipeline:
             local_report.mean_confidence,
         )
 
-        # ---- 4. Build final docs based on mode ---------------------------
-        final_docs: list[Document]
+        # ---- Build final docs
         if mode == "local":
-            final_docs = local_report.relevant_docs
-
+            final_docs: list[Document] = local_report.relevant_docs
         elif mode == "web":
-            web_docs = self.web_searcher.search(standalone_question, telemetry)
+            web_docs = await self.web_searcher.search(standalone_question, telemetry)
             if not web_docs:
-                return self._build_fallback_result(
+                result = self._build_fallback_result(
                     FallbackReason.WEB_SEARCH_FAILED, telemetry,
                     used_web=True, conversation=conversation,
                     standalone=standalone_question if was_rewritten else None,
-                    session_id=session_id, user_id=user_id,
+                    session_id=session_id, user_id=user_id, tenant_id=tenant_id,
                 )
-            web_report = self.grader.grade(
-                web_docs, standalone_question, self._chunk_pool,
-                telemetry, label="web",
+                if conversation is not None:
+                    await self.conversation_manager.record_assistant_message(
+                        conversation, result.answer
+                    )
+                yield result
+                return
+            web_report = await self.grader.grade(
+                web_docs, standalone_question,
+                self._chunk_sem, telemetry, label="web",
             )
             final_docs = web_report.relevant_docs
-
-        else:  # hybrid
-            web_docs = self.web_searcher.search(standalone_question, telemetry)
+        else:
+            web_docs = await self.web_searcher.search(standalone_question, telemetry)
             if web_docs:
-                web_report = self.grader.grade(
-                    web_docs, standalone_question, self._chunk_pool,
-                    telemetry, label="web",
+                web_report = await self.grader.grade(
+                    web_docs, standalone_question,
+                    self._chunk_sem, telemetry, label="web",
                 )
                 final_docs = deduplicate_docs(
                     local_report.relevant_docs + web_report.relevant_docs
@@ -335,29 +311,33 @@ class CRAGPipeline:
                 final_docs = local_report.relevant_docs
 
         if not final_docs:
-            return self._build_fallback_result(
+            result = self._build_fallback_result(
                 FallbackReason.EMPTY_RETRIEVAL, telemetry,
                 used_web=used_web, conversation=conversation,
                 standalone=standalone_question if was_rewritten else None,
-                session_id=session_id, user_id=user_id,
+                session_id=session_id, user_id=user_id, tenant_id=tenant_id,
             )
+            if conversation is not None:
+                await self.conversation_manager.record_assistant_message(
+                    conversation, result.answer
+                )
+            yield result
+            return
 
-        # ---- 5. Generate -------------------------------------------------
-        # Use the ORIGINAL question for generation (so the answer matches
-        # what the user actually typed). The standalone form was only for
-        # retrieval, where keyword density and reference resolution matter.
+        # ---- Generate (stream tokens)
         labelled_context = format_docs(final_docs)
-        answer = self._generate(
-            question=question,
-            labelled_context=labelled_context,
-            user_context_block=user_context_block,
-            on_token=on_token,
-            telemetry=telemetry,
-        )
+        chunks: list[str] = []
+        async for tok in self._generate_stream(
+            question, labelled_context, user_context_block, telemetry
+        ):
+            chunks.append(tok)
+            yield tok
+        original_answer = "".join(chunks)
 
-        # ---- 6. Verify faithfulness --------------------------------------
-        verification = self.verifier.verify_answer(
-            question, answer, labelled_context, self._claim_pool, telemetry,
+        # ---- Verify
+        verification = await self.verifier.verify_answer(
+            question, original_answer, labelled_context,
+            self._claim_sem, telemetry,
         )
         logger.info(
             "[verify] score=%.2f relevance=%s claims=%d/%d",
@@ -365,32 +345,31 @@ class CRAGPipeline:
             len(verification.supported), verification.total,
         )
 
-        # ---- 7. Self-correct if needed -----------------------------------
-        correction = self.corrector.correct_if_needed(
-            question, answer, verification,
-            labelled_context, self._claim_pool, telemetry,
+        # ---- Self-correct
+        correction = await self.corrector.correct_if_needed(
+            question, original_answer, verification, labelled_context,
+            self._claim_sem, telemetry,
         )
 
         final_answer = correction.final_answer
         is_off_topic = correction.fallback_reason == FallbackReason.OFF_TOPIC
 
-        # ---- 8. Record assistant message in conversation -----------------
+        # ---- Record assistant message
         if conversation is not None:
-            self.conversation_manager.record_assistant_message(
+            await self.conversation_manager.record_assistant_message(
                 conversation, final_answer
             )
 
-        # ---- 9. Schedule async user-memory extraction --------------------
-        # Skip extraction on fallbacks — extracting facts from system fallback
-        # text would pollute memory with non-user content.
+        # ---- Schedule async fact extraction
         if correction.fallback_reason == FallbackReason.NONE:
             self.user_memory.schedule_extraction(
                 user_id=user_id,
                 user_message=question,
                 assistant_message=final_answer,
+                tenant_id=tenant_id,
             )
 
-        return CRAGResult(
+        yield CRAGResult(
             answer=final_answer,
             faithfulness_score=correction.final_score,
             fallback_reason=correction.fallback_reason,
@@ -402,10 +381,40 @@ class CRAGPipeline:
             user_facts_used=[f.text for f in user_facts],
             session_id=session_id,
             user_id=user_id,
+            tenant_id=tenant_id,
             telemetry=telemetry.summary(),
         )
 
-    # ---- Fallback helper ----------------------------------------------
+    # ---- Public API: callback-based ----
+
+    @traceable(name="crag.run_query", tags=["crag"])
+    async def run_query(
+        self,
+        question: str,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        filters: Optional[dict[str, Any]] = None,
+        on_token: Optional[OnToken] = None,
+    ) -> CRAGResult:
+        """Async, callback-based variant. Returns the final CRAGResult."""
+        callback = on_token or _noop_on_token
+        result: Optional[CRAGResult] = None
+        async for chunk in self.astream_query(
+            question,
+            session_id=session_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            filters=filters,
+        ):
+            if isinstance(chunk, CRAGResult):
+                result = chunk
+            else:
+                await _maybe_await(callback(chunk))
+        assert result is not None
+        return result
+
+    # ---- Fallback helper ----
 
     def _build_fallback_result(
         self,
@@ -416,34 +425,27 @@ class CRAGPipeline:
         standalone: Optional[str] = None,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> CRAGResult:
-        logger.warning("[pipeline] Returning fallback: %s", reason.value)
-        fallback_msg = self.cfg.hallucination_fallback
-
-        # Even on fallback, record the turn — otherwise the next rewriter sees
-        # a hole in conversation history and behaves oddly.
-        if conversation is not None:
-            self.conversation_manager.record_assistant_message(
-                conversation, fallback_msg
-            )
-
+        logger.warning("[pipeline] Fallback: %s", reason.value)
         return CRAGResult(
-            answer=fallback_msg,
+            answer=self.cfg.hallucination_fallback,
             faithfulness_score=0.0,
             fallback_reason=reason,
             used_web_search=used_web,
             standalone_question=standalone,
             session_id=session_id,
             user_id=user_id,
+            tenant_id=tenant_id,
             telemetry=telemetry.summary(),
         )
 
-    # ---- Memory management API (for callers) --------------------------
+    # ---- Memory management API ----
 
-    def end_session(self, session_id: str) -> None:
-        """Drop conversation history for this session."""
-        self.conversation_manager.end_session(session_id)
+    async def end_session(self, session_id: str) -> None:
+        await self.conversation_manager.end_session(session_id)
 
-    def forget_user(self, user_id: str) -> None:
-        """Wipe all user memory for the given user (GDPR / 'forget me')."""
-        self.user_memory.clear_user(user_id)
+    async def forget_user(
+        self, user_id: str, tenant_id: Optional[str] = None
+    ) -> None:
+        await self.user_memory.clear_user(user_id, tenant_id)
