@@ -1,15 +1,5 @@
 """
-All prompts in one place.
-
-Why one file: prompt drift is a top-3 source of regression in RAG systems.
-Having every prompt visible in one ~100-line file makes audit trivial — you
-can diff against last week and see exactly what changed in the system's
-behavior. The moment we have >15 prompts or per-prompt versioning needs,
-this splits into a directory. Not yet.
-
-Each prompt is a ChatPromptTemplate factory function — they take no args
-because we want template-time errors (missing variable) to surface at module
-import, not at first query.
+All prompts in one file. Schemas live in schemas.py.
 """
 
 from __future__ import annotations
@@ -24,7 +14,8 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
      "You are a precise, helpful assistant. Answer ONLY from the provided context. "
      "Be concise and structured. If the answer is not in the context, say: "
      "\"I could not find the answer in the provided documents.\" "
-     "Do not hallucinate. Cite chunk numbers (e.g., [Chunk 3]) where useful."),
+     "Do not hallucinate. Cite chunk numbers (e.g., [Chunk 3]) where useful.\n\n"
+     "{user_context_block}"),
     ("human",
      "Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"),
 ])
@@ -49,7 +40,8 @@ SELF_CORRECTION_PROMPT = ChatPromptTemplate.from_messages([
 GRADER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a strict relevance grader. Answer 'yes' only if the chunk directly "
-     "helps answer the question, 'no' if off-topic or only tangentially related."),
+     "helps answer the question, 'no' if off-topic or only tangentially related. "
+     "Provide a confidence in [0,1]."),
     ("human",
      "Document chunk:\n{document}\n\nQuestion: {question}\n\nIs this chunk relevant?"),
 ])
@@ -102,7 +94,6 @@ CLAIM_EXTRACTOR_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "Answer:\n{answer}\n\nList all factual claims:"),
 ])
 
-# Batched verifier — N claims per call, returns N verdicts in order.
 CLAIM_BATCH_VERIFIER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a fact verifier. For each numbered claim, decide if the CONTEXT "
@@ -114,3 +105,35 @@ CLAIM_BATCH_VERIFIER_PROMPT = ChatPromptTemplate.from_messages([
      "CLAIMS:\n{numbered_claims}\n\n"
      "Verdicts (one per claim, in order):"),
 ])
+
+
+# ---------------------------------------------------------------- Memory
+
+CONVERSATIONAL_REWRITE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Rewrite the user's follow-up question into a standalone question that "
+     "can be understood without the conversation history. Resolve pronouns "
+     "(it, that, they, this) and implicit references using the history. "
+     "If the question is already self-contained, return it unchanged and set "
+     "needed_rewriting=false. Output the standalone question only — no preamble."),
+    ("human",
+     "Conversation history (most recent last):\n{history}\n\n"
+     "Follow-up question: {question}\n\n"
+     "Standalone question:"),
+])
+
+USER_FACT_EXTRACTOR_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Extract DURABLE facts about the user from this conversation turn. "
+     "Durable means: preferences, constraints (allergies, restrictions), "
+     "context (job, location, expertise), goals, ongoing situations. "
+     "EXCLUDE: questions the user asked, one-off curiosities, generic chitchat, "
+     "facts about the world. Return only what would be useful weeks later. "
+     "If nothing memory-worthy was said, return an empty list."),
+    ("human",
+     "User said: {user_message}\n"
+     "Assistant replied: {assistant_message}\n\n"
+     "Durable facts about the user:"),
+])
+
+USER_MEMORY_CONTEXT_HEADER = "Known facts about the user (from previous conversations):"
